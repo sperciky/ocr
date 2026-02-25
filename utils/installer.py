@@ -2,19 +2,17 @@
 Auto-Installer Utilities
 ========================
 Handles runtime installation of missing Python packages,
-locates Tesseract / Poppler system binaries at common paths on all
-platforms, and downloads the Argos RU→EN translation model.
+locates Tesseract / Poppler system binaries using every available
+detection strategy, and downloads the Argos RU→EN translation model.
 
-Design principles
------------------
-- Python packages : install via `pip` using the *current* interpreter
-  (sys.executable) so the right venv is always targeted.
-- System binaries  : cannot be pip-installed; we probe common install
-  locations and configure the library path accordingly. If not found
-  we surface a clear, platform-specific install command.
-- Argos model      : download once from the official index using the
-  argostranslate package API; requires an internet connection the
-  first time only.
+Tesseract detection order (Windows)
+------------------------------------
+1. pytesseract default PATH check
+2. `where tesseract` subprocess call  (works even if pytesseract's check fails)
+3. Windows Registry  HKLM\\SOFTWARE\\Tesseract-OCR  (UB-Mannheim installer writes here)
+4. `winget list` output parsing
+5. Known hard-coded paths  (Program Files, AppData, …)
+6. Recursive glob across Program Files / C:\\Users\\<user>\\AppData
 """
 
 from __future__ import annotations
@@ -23,6 +21,7 @@ import importlib.util
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,53 +29,57 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Platform constants
-# ---------------------------------------------------------------------------
-_SYSTEM = platform.system()  # "Windows" | "Darwin" | "Linux"
+_SYSTEM = platform.system()   # "Windows" | "Darwin" | "Linux"
 
-# Common Tesseract installation paths (checked in order)
-_TESSERACT_WINDOWS_PATHS: List[str] = [
+# ---------------------------------------------------------------------------
+# Constant candidate lists
+# ---------------------------------------------------------------------------
+
+_TESSERACT_WINDOWS_HARDCODED: List[str] = [
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files\Tesseract-OCR 5\tesseract.exe",
+    r"C:\Program Files\Tesseract-OCR 5.3\tesseract.exe",
+    r"C:\Program Files\Tesseract-OCR 5.4\tesseract.exe",
     r"C:\Tesseract-OCR\tesseract.exe",
     r"C:\tesseract\tesseract.exe",
-    # UB-Mannheim versioned install (e.g. Tesseract-OCR 5.x)
-    r"C:\Program Files\Tesseract-OCR 5\tesseract.exe",
+    r"C:\tools\tesseract\tesseract.exe",          # Chocolatey default
+    # Per-user locations (filled in at runtime)
     r"C:\Users\{user}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
     r"C:\Users\{user}\AppData\Local\Tesseract-OCR\tesseract.exe",
+    r"C:\Users\{user}\scoop\apps\tesseract\current\tesseract.exe",  # Scoop
 ]
-_TESSERACT_MACOS_PATHS: List[str] = [
-    "/usr/local/bin/tesseract",          # Intel Homebrew
-    "/opt/homebrew/bin/tesseract",       # Apple-Silicon Homebrew
+
+_TESSERACT_MACOS: List[str] = [
+    "/usr/local/bin/tesseract",      # Homebrew Intel
+    "/opt/homebrew/bin/tesseract",   # Homebrew Apple-Silicon
     "/usr/bin/tesseract",
 ]
-_TESSERACT_LINUX_PATHS: List[str] = [
+
+_TESSERACT_LINUX: List[str] = [
     "/usr/bin/tesseract",
     "/usr/local/bin/tesseract",
 ]
 
-# Common Poppler/pdftoppm paths
-_POPPLER_WINDOWS_PATHS: List[str] = [
+_POPPLER_WINDOWS_HARDCODED: List[str] = [
     r"C:\Program Files\poppler\bin",
     r"C:\Program Files (x86)\poppler\bin",
     r"C:\poppler\bin",
-    r"C:\poppler-23\bin",
-    r"C:\poppler-24\bin",
+    r"C:\tools\poppler\bin",                       # Chocolatey
+    r"C:\Users\{user}\scoop\apps\poppler\current\bin",
 ]
 
-# Python package name → importable name mapping
 _PYTHON_PACKAGES: Dict[str, str] = {
-    "pytesseract": "pytesseract",
-    "pdf2image": "pdf2image",
-    "Pillow": "PIL",
-    "opencv-python": "cv2",
-    "pymupdf": "fitz",
-    "reportlab": "reportlab",
-    "python-docx": "docx",
-    "argostranslate": "argostranslate",
-    "numpy": "numpy",
-    "pandas": "pandas",
+    "pytesseract":  "pytesseract",
+    "pdf2image":    "pdf2image",
+    "Pillow":       "PIL",
+    "opencv-python":"cv2",
+    "pymupdf":      "fitz",
+    "reportlab":    "reportlab",
+    "python-docx":  "docx",
+    "argostranslate":"argostranslate",
+    "numpy":        "numpy",
+    "pandas":       "pandas",
 }
 
 
@@ -85,102 +88,199 @@ _PYTHON_PACKAGES: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def is_importable(import_name: str) -> bool:
-    """Return True when *import_name* can be imported."""
     return importlib.util.find_spec(import_name) is not None
 
 
 def pip_install(packages: List[str]) -> Tuple[bool, str]:
-    """
-    Install one or more pip packages using the current Python interpreter.
-
-    Returns
-    -------
-    (success: bool, message: str)
-    """
     if not packages:
         return True, "Nothing to install."
-
     cmd = [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"] + packages
-    logger.info("Running: %s", " ".join(cmd))
-
+    logger.info("pip install: %s", " ".join(packages))
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode == 0:
-            return True, f"Successfully installed: {', '.join(packages)}"
-        err = (result.stderr or result.stdout or "Unknown error").strip()
-        return False, f"pip failed (rc={result.returncode}): {err}"
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            return True, f"Installed: {', '.join(packages)}"
+        return False, (r.stderr or r.stdout or "Unknown pip error").strip()
     except subprocess.TimeoutExpired:
         return False, "pip timed out after 5 minutes."
     except Exception as exc:
-        return False, f"pip error: {exc}"
+        return False, str(exc)
 
 
 def install_missing_python_packages() -> List[Tuple[str, bool, str]]:
-    """
-    Check every required Python package and pip-install any that are missing.
-
-    Returns
-    -------
-    List of (pip_name, success, message) for every package that was absent.
-    """
     missing = [
-        pip_name
-        for pip_name, import_name in _PYTHON_PACKAGES.items()
-        if not is_importable(import_name)
+        name for name, imp in _PYTHON_PACKAGES.items()
+        if not is_importable(imp)
     ]
-
     if not missing:
         return []
-
     ok, msg = pip_install(missing)
     return [(pkg, ok, msg) for pkg in missing]
 
 
 # ---------------------------------------------------------------------------
-# Tesseract binary discovery & configuration
+# Tesseract detection strategies
 # ---------------------------------------------------------------------------
 
-def _candidate_tesseract_paths() -> List[str]:
-    user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+def _user() -> str:
+    return os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+
+
+def _expand(path: str) -> str:
+    return path.replace("{user}", _user())
+
+
+# ── Strategy 1: pytesseract's own check (uses system PATH) ──────────────────
+def _try_pytesseract_default() -> Optional[str]:
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+        return pytesseract.pytesseract.tesseract_cmd  # usually just "tesseract"
+    except Exception:
+        return None
+
+
+# ── Strategy 2: `where` (Windows) / `which` (Unix) ─────────────────────────
+def _try_where_command() -> Optional[str]:
+    """Ask the OS shell where tesseract lives."""
+    cmd = "where" if _SYSTEM == "Windows" else "which"
+    try:
+        r = subprocess.run(
+            [cmd, "tesseract"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            first_line = r.stdout.strip().splitlines()[0].strip()
+            if first_line and Path(first_line).is_file():
+                logger.info("'%s tesseract' → %s", cmd, first_line)
+                return first_line
+    except Exception:
+        pass
+    return None
+
+
+# ── Strategy 3: Windows Registry ────────────────────────────────────────────
+def _try_registry() -> Optional[str]:
+    """UB-Mannheim installer writes InstallDir to the registry."""
+    if _SYSTEM != "Windows":
+        return None
+    try:
+        import winreg
+        hives_and_keys = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tesseract-OCR"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tesseract-OCR"),
+            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Tesseract-OCR"),
+        ]
+        for hive, key_path in hives_and_keys:
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
+                    exe = Path(install_dir) / "tesseract.exe"
+                    if exe.is_file():
+                        logger.info("Registry → %s", exe)
+                        return str(exe)
+            except (FileNotFoundError, OSError):
+                continue
+    except ImportError:
+        pass
+    return None
+
+
+# ── Strategy 4: parse `winget list` output ───────────────────────────────────
+def _try_winget_list() -> Optional[str]:
+    """
+    Run `winget list --name tesseract` and, if found, scan the known
+    winget install root (%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages).
+    """
+    if _SYSTEM != "Windows":
+        return None
+    try:
+        r = subprocess.run(
+            ["winget", "list", "--name", "tesseract"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode != 0 or "tesseract" not in r.stdout.lower():
+            return None
+        # winget installs here by default
+        winget_pkg_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+        if winget_pkg_root.is_dir():
+            for pkg_dir in winget_pkg_root.iterdir():
+                if "tesseract" in pkg_dir.name.lower():
+                    for exe in pkg_dir.rglob("tesseract.exe"):
+                        logger.info("winget packages → %s", exe)
+                        return str(exe)
+    except Exception:
+        pass
+    return None
+
+
+# ── Strategy 5: hard-coded paths list ────────────────────────────────────────
+def _try_hardcoded_paths() -> Optional[str]:
     if _SYSTEM == "Windows":
-        paths = [p.replace("{user}", user) for p in _TESSERACT_WINDOWS_PATHS]
-        # Also glob versioned Program Files entries
-        for base in [Path(r"C:\Program Files"), Path(r"C:\Program Files (x86)")]:
-            if base.exists():
-                for entry in base.iterdir():
-                    if "tesseract" in entry.name.lower():
-                        exe = entry / "tesseract.exe"
-                        if exe.exists():
-                            paths.insert(0, str(exe))
-        return paths
-    if _SYSTEM == "Darwin":
-        return _TESSERACT_MACOS_PATHS
-    return _TESSERACT_LINUX_PATHS
+        candidates = [_expand(p) for p in _TESSERACT_WINDOWS_HARDCODED]
+    elif _SYSTEM == "Darwin":
+        candidates = _TESSERACT_MACOS
+    else:
+        candidates = _TESSERACT_LINUX
 
-
-def find_tesseract_binary() -> Optional[str]:
-    """
-    Search known install locations for the Tesseract executable.
-    Returns the full path string if found, or None.
-    """
-    for path in _candidate_tesseract_paths():
+    for path in candidates:
         if Path(path).is_file():
-            logger.info("Found Tesseract at: %s", path)
+            logger.info("Hard-coded path → %s", path)
             return path
     return None
 
 
-def configure_tesseract() -> Tuple[bool, str]:
+# ── Strategy 6: recursive glob in known root directories ─────────────────────
+def _try_recursive_glob() -> Optional[str]:
+    if _SYSTEM != "Windows":
+        return None
+
+    search_roots = [
+        Path(r"C:\Program Files"),
+        Path(r"C:\Program Files (x86)"),
+        Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local")),
+        Path(os.environ.get("APPDATA",      r"C:\Users\Default\AppData\Roaming")),
+        Path(os.environ.get("USERPROFILE",  rf"C:\Users\{_user()}")),
+    ]
+
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        try:
+            for exe in root.rglob("tesseract.exe"):
+                logger.info("Recursive glob → %s", exe)
+                return str(exe)
+        except PermissionError:
+            continue
+    return None
+
+
+# ── Master finder ─────────────────────────────────────────────────────────────
+def find_tesseract_binary() -> Optional[str]:
     """
-    Try to make Tesseract available to pytesseract:
-      1. Test PATH first (already works on most systems).
-      2. Search common install locations.
-      3. Set pytesseract.pytesseract.tesseract_cmd if found.
+    Try every detection strategy in order; return the first working path.
+    """
+    for strategy in [
+        _try_pytesseract_default,
+        _try_where_command,
+        _try_registry,
+        _try_winget_list,
+        _try_hardcoded_paths,
+        _try_recursive_glob,
+    ]:
+        result = strategy()
+        if result:
+            return result
+    return None
+
+
+def configure_tesseract(custom_path: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Locate Tesseract using every available strategy and configure pytesseract.
+
+    Parameters
+    ----------
+    custom_path : A user-supplied path to try first (from the UI input widget).
 
     Returns
     -------
@@ -189,96 +289,126 @@ def configure_tesseract() -> Tuple[bool, str]:
     try:
         import pytesseract
     except ImportError:
-        return False, "pytesseract not installed — run pip install pytesseract"
+        return False, "pytesseract not installed — run: pip install pytesseract"
 
-    # Step 1: already in PATH?
+    # User-supplied path takes priority
+    if custom_path:
+        custom_path = custom_path.strip().strip('"').strip("'")
+        if Path(custom_path).is_file():
+            pytesseract.pytesseract.tesseract_cmd = custom_path
+        elif Path(custom_path).is_dir():
+            exe = Path(custom_path) / ("tesseract.exe" if _SYSTEM == "Windows" else "tesseract")
+            if exe.is_file():
+                pytesseract.pytesseract.tesseract_cmd = str(exe)
+
+    # Check if the current cmd already works (covers PATH and prior custom_path)
     try:
         ver = pytesseract.get_tesseract_version()
-        return True, f"Tesseract {ver} found in PATH."
+        return True, f"Tesseract {ver} ready ({pytesseract.pytesseract.tesseract_cmd})"
     except Exception:
         pass
 
-    # Step 2: probe common locations
+    # Run through all detection strategies
     found = find_tesseract_binary()
     if found:
         pytesseract.pytesseract.tesseract_cmd = found
+        # Also add its directory to PATH so sub-processes can find it too
+        tess_dir = str(Path(found).parent)
+        os.environ["PATH"] = tess_dir + os.pathsep + os.environ.get("PATH", "")
         try:
             ver = pytesseract.get_tesseract_version()
-            return True, f"Tesseract {ver} configured at: {found}"
+            return True, f"Tesseract {ver} — auto-configured at:\n{found}"
         except Exception as exc:
-            return False, f"Found binary at {found} but could not run it: {exc}"
+            return False, f"Binary found at {found} but could not execute it: {exc}"
 
-    # Step 3: give a platform-specific install command
-    install_hint = _tesseract_install_hint()
-    return False, f"Tesseract not found.\n\n{install_hint}"
+    return False, _tesseract_not_found_message()
 
 
-def _tesseract_install_hint() -> str:
+def _tesseract_not_found_message() -> str:
     if _SYSTEM == "Windows":
         return (
-            "Install Tesseract on Windows:\n"
-            "  1. Download the installer from:\n"
-            "     https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "  2. During setup tick 'Additional language data' → Russian\n"
-            "  3. Add the install folder to your PATH, OR restart this app\n"
-            "     (the app will find it automatically in Program Files).\n\n"
-            "  Quick install via winget (run in PowerShell as Administrator):\n"
-            "     winget install UB-Mannheim.TesseractOCR\n\n"
-            "  Quick install via Chocolatey:\n"
-            "     choco install tesseract --pre"
+            "Tesseract was not found in any of the expected locations.\n\n"
+            "Option A — winget (PowerShell, no admin needed for user install):\n"
+            "  winget install UB-Mannheim.TesseractOCR\n\n"
+            "Option B — Chocolatey (run PowerShell as Administrator):\n"
+            "  choco install tesseract --pre\n\n"
+            "Option C — Manual installer:\n"
+            "  https://github.com/UB-Mannheim/tesseract/wiki\n"
+            "  ✔ Tick 'Additional language data (download)' → Russian during setup\n\n"
+            "After installing, use the 'Enter path manually' box below OR click\n"
+            "'🔄 Retry Detection' — the app will find it automatically."
         )
     if _SYSTEM == "Darwin":
         return (
-            "Install Tesseract on macOS:\n"
             "  brew install tesseract\n"
-            "  brew install tesseract-lang   # all language packs incl. Russian"
+            "  brew install tesseract-lang"
         )
     return (
-        "Install Tesseract on Linux:\n"
         "  sudo apt-get install -y tesseract-ocr tesseract-ocr-rus\n"
-        "  # Optional extra languages:\n"
         "  sudo apt-get install -y tesseract-ocr-deu tesseract-ocr-fra "
         "tesseract-ocr-ita tesseract-ocr-ces"
     )
 
 
 # ---------------------------------------------------------------------------
-# Poppler discovery (needed by pdf2image)
+# Poppler detection
 # ---------------------------------------------------------------------------
 
 def _find_poppler_windows() -> Optional[str]:
-    for path in _POPPLER_WINDOWS_PATHS:
+    user = _user()
+    candidates = [_expand(p) for p in _POPPLER_WINDOWS_HARDCODED]
+
+    # Hard-coded first
+    for path in candidates:
         p = Path(path)
         if p.is_dir() and (p / "pdftoppm.exe").is_file():
             return str(p)
-    # Glob search
-    for base in [Path(r"C:\Program Files"), Path(r"C:\Program Files (x86)"), Path("C:\\")]:
-        if not base.exists():
+
+    # `where pdftoppm`
+    try:
+        r = subprocess.run(["where", "pdftoppm"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            exe = r.stdout.strip().splitlines()[0]
+            return str(Path(exe).parent)
+    except Exception:
+        pass
+
+    # Recursive glob in Program Files and AppData
+    roots = [
+        Path(r"C:\Program Files"),
+        Path(r"C:\Program Files (x86)"),
+        Path(os.environ.get("LOCALAPPDATA", rf"C:\Users\{user}\AppData\Local")),
+        Path(os.environ.get("USERPROFILE",  rf"C:\Users\{user}")),
+    ]
+    for root in roots:
+        if not root.is_dir():
             continue
-        for entry in base.iterdir():
-            if "poppler" in entry.name.lower():
-                candidate = entry / "bin"
-                if (candidate / "pdftoppm.exe").is_file():
-                    return str(candidate)
+        try:
+            for exe in root.rglob("pdftoppm.exe"):
+                return str(exe.parent)
+        except PermissionError:
+            continue
     return None
 
 
-def configure_poppler() -> Tuple[bool, Optional[str]]:
+def configure_poppler(custom_path: Optional[str] = None) -> Tuple[bool, Optional[str]]:
     """
-    Locate pdftoppm (Poppler) and return (found: bool, bin_path_or_None).
-    On Linux/macOS Poppler is usually in PATH; on Windows we search common paths.
+    Locate Poppler's bin directory and return (found, bin_path).
+    Injects the path into os.environ['PATH'] when found on Windows.
     """
     if _SYSTEM != "Windows":
-        # Just verify pdftoppm is callable
-        result = subprocess.run(
-            ["pdftoppm", "-v"], capture_output=True, text=True
-        )
-        return result.returncode == 0, None
+        r = subprocess.run(["pdftoppm", "-v"], capture_output=True, timeout=5)
+        return r.returncode == 0, None
 
-    # Windows: search common locations
+    # User-supplied path
+    if custom_path:
+        p = Path(custom_path.strip().strip('"'))
+        if (p / "pdftoppm.exe").is_file():
+            os.environ["PATH"] = str(p) + os.pathsep + os.environ.get("PATH", "")
+            return True, str(p)
+
     bin_path = _find_poppler_windows()
     if bin_path:
-        # Add to os.environ PATH so pdf2image can find it
         os.environ["PATH"] = bin_path + os.pathsep + os.environ.get("PATH", "")
         logger.info("Poppler configured at: %s", bin_path)
         return True, bin_path
@@ -288,14 +418,12 @@ def configure_poppler() -> Tuple[bool, Optional[str]]:
 def poppler_install_hint() -> str:
     if _SYSTEM == "Windows":
         return (
-            "Install Poppler on Windows:\n"
-            "  1. Download from:\n"
-            "     https://github.com/oschwartz10612/poppler-windows/releases\n"
-            "  2. Extract and add the bin\\ folder to your PATH.\n\n"
-            "  Quick install via winget:\n"
-            "     winget install poppler\n\n"
-            "  Quick install via Chocolatey:\n"
-            "     choco install poppler"
+            "winget install poppler\n"
+            "# — or —\n"
+            "choco install poppler\n"
+            "# — or manual —\n"
+            "# 1. Download from https://github.com/oschwartz10612/poppler-windows/releases\n"
+            "# 2. Extract anywhere, then enter the path to the bin\\ folder below."
         )
     if _SYSTEM == "Darwin":
         return "brew install poppler"
@@ -311,21 +439,7 @@ def install_argos_model(
     to_code: str = "en",
     progress_callback=None,
 ) -> Tuple[bool, str]:
-    """
-    Download and install an Argos Translate language model from the official
-    package index. Requires a one-time internet connection.
-
-    Parameters
-    ----------
-    from_code         : ISO 639-1 source language code.
-    to_code           : ISO 639-1 target language code.
-    progress_callback : Optional callable(message: str) for status updates.
-
-    Returns
-    -------
-    (success: bool, message: str)
-    """
-    def _progress(msg: str) -> None:
+    def _cb(msg: str) -> None:
         logger.info(msg)
         if progress_callback:
             progress_callback(msg)
@@ -333,12 +447,11 @@ def install_argos_model(
     try:
         import argostranslate.package
     except ImportError:
-        return False, "argostranslate is not installed. Run: pip install argostranslate"
+        return False, "argostranslate not installed — run: pip install argostranslate"
 
     try:
-        _progress("Fetching Argos package index …")
+        _cb("Fetching Argos package index …")
         argostranslate.package.update_package_index()
-
         available = argostranslate.package.get_available_packages()
         pkg = next(
             (p for p in available if p.from_code == from_code and p.to_code == to_code),
@@ -346,29 +459,23 @@ def install_argos_model(
         )
         if pkg is None:
             return False, (
-                f"No Argos package found for {from_code}→{to_code}. "
-                "Check your internet connection and try again."
+                f"Package {from_code}→{to_code} not found in the Argos index. "
+                "Check your internet connection."
             )
-
-        _progress(f"Downloading {from_code}→{to_code} model (~100 MB) …")
-        download_path = pkg.download()
-
-        _progress("Installing model …")
-        argostranslate.package.install_from_path(download_path)
-
-        return True, f"Argos {from_code}→{to_code} model installed successfully."
-
+        _cb(f"Downloading {from_code}→{to_code} model (~100 MB) …")
+        path = pkg.download()
+        _cb("Installing …")
+        argostranslate.package.install_from_path(path)
+        return True, f"Argos {from_code}→{to_code} model installed."
     except Exception as exc:
-        return False, f"Model installation failed: {exc}"
+        return False, f"Installation failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# All-in-one startup routine
+# StartupResult + orchestrator
 # ---------------------------------------------------------------------------
 
 class StartupResult:
-    """Aggregates the results of the startup dependency check."""
-
     def __init__(self) -> None:
         self.python_packages_installed: List[Tuple[str, bool, str]] = []
         self.tesseract_ok: bool = False
@@ -391,36 +498,25 @@ class StartupResult:
         return self.tesseract_ok and self.argos_ok
 
 
-def run_startup_checks() -> StartupResult:
+def run_startup_checks(
+    custom_tesseract_path: Optional[str] = None,
+    custom_poppler_path: Optional[str] = None,
+) -> StartupResult:
     """
-    Execute all dependency checks and auto-fixes at application startup.
-
-    1. Install missing Python packages via pip.
-    2. Locate / configure Tesseract.
-    3. Locate / configure Poppler (Windows only).
-    4. Verify the Argos RU→EN model (does NOT auto-download — needs UI consent).
-
-    Returns a StartupResult summary.
+    Run all dependency checks.  Call with custom paths when the user has
+    entered them manually in the UI.
     """
     result = StartupResult()
 
-    # ── 1. Python packages ──────────────────────────────────────────────────
     result.python_packages_installed = install_missing_python_packages()
+    result.tesseract_ok, result.tesseract_message = configure_tesseract(custom_tesseract_path)
+    result.poppler_ok, result.poppler_path = configure_poppler(custom_poppler_path)
 
-    # ── 2. Tesseract ────────────────────────────────────────────────────────
-    result.tesseract_ok, result.tesseract_message = configure_tesseract()
-
-    # ── 3. Poppler ──────────────────────────────────────────────────────────
-    result.poppler_ok, result.poppler_path = configure_poppler()
-
-    # ── 4. Argos model ──────────────────────────────────────────────────────
     try:
         from translation.translator import check_ru_en_model
         result.argos_ok = check_ru_en_model()
         result.argos_message = (
-            "RU→EN model is installed."
-            if result.argos_ok
-            else "RU→EN model not found."
+            "RU→EN model ready." if result.argos_ok else "RU→EN model not found."
         )
     except Exception as exc:
         result.argos_ok = False

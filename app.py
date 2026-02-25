@@ -67,36 +67,39 @@ st.markdown(
 
 # ---------------------------------------------------------------------------
 # ① Startup: auto-install Python packages + configure system binaries
-#    Cached so it runs exactly once per Streamlit server session.
+#    NOT cached — re-runs whenever the user clicks Retry or supplies a path.
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner=False)
-def _run_startup() -> "StartupResult":  # noqa: F821  (forward reference resolved below)
+def _run_startup(
+    custom_tesseract: Optional[str] = None,
+    custom_poppler: Optional[str] = None,
+) -> Any:
     from utils.installer import run_startup_checks
-    return run_startup_checks()
+    return run_startup_checks(
+        custom_tesseract_path=custom_tesseract or None,
+        custom_poppler_path=custom_poppler or None,
+    )
 
 
-def _show_startup_banner(result: Any) -> None:
+def _show_startup_banner(result: Any) -> bool:
     """
-    Render a collapsible status panel showing what was auto-fixed and what
-    still needs manual action.  Only shown when something is not perfect.
+    Render the dependency status panel.
+    Returns True when Tesseract is still missing (caller should st.stop()).
     """
     from utils.installer import poppler_install_hint
 
-    # Collect lines for the expander title
     ok_count = sum([result.tesseract_ok, result.argos_ok, result.poppler_ok])
-    total = 3
-    title = f"🔧 Dependency Status  ({ok_count}/{total} ready)"
+    label = f"🔧 Dependency Status  ({ok_count}/3 ready)"
 
-    with st.expander(title, expanded=not result.all_ok):
+    with st.expander(label, expanded=not result.all_ok):
 
         # ── Python packages ────────────────────────────────────────────────
         if result.python_packages_installed:
-            installed_ok   = [p for p, ok, _ in result.python_packages_installed if ok]
-            installed_fail = [(p, m) for p, ok, m in result.python_packages_installed if not ok]
-            if installed_ok:
-                st.success(f"✅ Auto-installed Python packages: {', '.join(installed_ok)}")
-            for pkg, msg in installed_fail:
+            good = [p for p, ok, _ in result.python_packages_installed if ok]
+            bad  = [(p, m) for p, ok, m in result.python_packages_installed if not ok]
+            if good:
+                st.success(f"✅ Auto-installed: {', '.join(good)}")
+            for pkg, msg in bad:
                 st.error(f"❌ Could not install `{pkg}`: {msg}")
         else:
             st.success("✅ All Python packages already installed.")
@@ -107,8 +110,27 @@ def _show_startup_banner(result: Any) -> None:
         if result.tesseract_ok:
             st.success(f"✅ Tesseract — {result.tesseract_message}")
         else:
-            st.error("❌ **Tesseract OCR** — not found. The app cannot run without it.")
+            st.error(
+                "❌ **Tesseract OCR not found.**  "
+                "Install it, then click **🔄 Retry Detection** below."
+            )
             st.code(result.tesseract_message, language="bash")
+
+            # Manual path input
+            st.markdown("**Already installed? Enter the path manually:**")
+            col_path, col_btn = st.columns([3, 1])
+            with col_path:
+                manual_tess = st.text_input(
+                    "Tesseract executable path",
+                    placeholder=r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                    key="manual_tess_path",
+                    label_visibility="collapsed",
+                )
+            with col_btn:
+                if st.button("Apply", key="apply_tess_path"):
+                    st.session_state["custom_tesseract"] = manual_tess
+                    st.session_state["startup_done"] = False
+                    st.rerun()
 
         st.markdown("---")
 
@@ -117,60 +139,78 @@ def _show_startup_banner(result: Any) -> None:
             loc = f" at `{result.poppler_path}`" if result.poppler_path else " (in PATH)"
             st.success(f"✅ Poppler{loc}")
         else:
-            st.warning("⚠️ Poppler not found — PDF rendering may fail.")
+            st.warning("⚠️ **Poppler not found** — PDF upload will fail. Image files still work.")
             st.code(poppler_install_hint(), language="bash")
+
+            col_ppath, col_pbtn = st.columns([3, 1])
+            with col_ppath:
+                manual_pop = st.text_input(
+                    "Poppler bin\\ path",
+                    placeholder=r"C:\poppler\bin",
+                    key="manual_pop_path",
+                    label_visibility="collapsed",
+                )
+            with col_pbtn:
+                if st.button("Apply", key="apply_pop_path"):
+                    st.session_state["custom_poppler"] = manual_pop
+                    st.session_state["startup_done"] = False
+                    st.rerun()
 
         st.markdown("---")
 
         # ── Argos model ────────────────────────────────────────────────────
         if result.argos_ok:
-            st.success("✅ Argos RU→EN model installed.")
+            st.success("✅ Argos RU→EN model ready.")
         else:
             st.warning(
-                "⚠️ Argos RU→EN translation model is not installed.  "
-                "OCR will still work but Russian text **won't be translated** "
-                "until you click the button below."
+                "⚠️ **RU→EN translation model not installed.**  "
+                "OCR still works — Russian text just won't be translated."
             )
             _render_argos_install_button()
 
+        st.markdown("---")
+
+        # ── Retry button ───────────────────────────────────────────────────
+        if st.button("🔄 Retry Detection", help="Re-scan for Tesseract and Poppler after installing them."):
+            st.session_state["startup_done"] = False
+            st.rerun()
+
+    return result.tesseract_missing
+
 
 def _render_argos_install_button() -> None:
-    """Render a button that downloads and installs the Argos RU→EN model."""
+    """One-click download and install of the Argos RU→EN model."""
     st.markdown(
-        "The model is ~100 MB and requires an internet connection **once**.  "
-        "After installation the app is fully offline."
+        "The model is **~100 MB** and needs internet **once only**. "
+        "After that the app is fully offline."
     )
     if st.button("⬇️ Download & Install RU→EN Model Now", type="primary"):
         status_box = st.empty()
-        progress = st.progress(0)
-        messages: List[str] = []
+        bar = st.progress(0)
+        calls: List[str] = []
 
         def _cb(msg: str) -> None:
-            messages.append(msg)
+            calls.append(msg)
             status_box.info(f"⏳ {msg}")
-            # crude progress: bump by 33 % each callback
-            progress.progress(min(1.0, len(messages) * 0.33))
+            bar.progress(min(1.0, len(calls) / 3))
 
         from utils.installer import install_argos_model
         ok, msg = install_argos_model(progress_callback=_cb)
-
-        progress.progress(1.0)
+        bar.progress(1.0)
         if ok:
             status_box.success(f"✅ {msg}")
-            # Invalidate cached startup so status updates
-            _run_startup.clear()
+            st.session_state["startup_done"] = False
             st.rerun()
         else:
             status_box.error(f"❌ {msg}")
             st.code(
-                "# Manual install (run once from any terminal):\n"
-                "python -c \"\n"
+                "# Run this once in any terminal / PowerShell:\n"
+                'python -c "\n'
                 "import argostranslate.package\n"
                 "argostranslate.package.update_package_index()\n"
                 "pkgs = argostranslate.package.get_available_packages()\n"
                 "pkg  = next(p for p in pkgs if p.from_code=='ru' and p.to_code=='en')\n"
-                "argostranslate.package.install_from_path(pkg.download())\n"
-                "\"",
+                'argostranslate.package.install_from_path(pkg.download())\n"',
                 language="bash",
             )
 
@@ -574,18 +614,22 @@ def main() -> None:
     )
 
     # ── Startup: auto-install packages + configure binaries ─────────────────
-    with st.spinner("Checking and configuring dependencies …"):
-        startup = _run_startup()
+    # Re-runs whenever the user clicks Retry or applies a manual path.
+    if not st.session_state.get("startup_done", False):
+        with st.spinner("Checking and configuring dependencies …"):
+            startup = _run_startup(
+                custom_tesseract=st.session_state.get("custom_tesseract", ""),
+                custom_poppler=st.session_state.get("custom_poppler", ""),
+            )
+        st.session_state["startup_result"] = startup
+        st.session_state["startup_done"] = True
+    else:
+        startup = st.session_state["startup_result"]
 
-    # Always show the status banner so users can see what was auto-fixed
-    _show_startup_banner(startup)
+    # Show status banner; returns True when Tesseract is still missing
+    tesseract_missing = _show_startup_banner(startup)
 
-    # Hard stop: Tesseract is required for any OCR
-    if startup.tesseract_missing:
-        st.error(
-            "❌ Tesseract OCR must be installed before you can use this app.  "
-            "See the **Dependency Status** panel above for platform-specific instructions."
-        )
+    if tesseract_missing:
         st.stop()
 
     # Sidebar
