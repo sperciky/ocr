@@ -459,7 +459,7 @@ def _render_page(
                 if settings["show_bbox"] and blocks
                 else page_img
             )
-            st.image(display, use_column_width=True)
+            st.image(display, use_container_width=True)
             if settings["show_bbox"] and blocks:
                 st.caption("🟢 Kept original  🔴 Translated from Russian")
             if page_data["num_columns"] > 1:
