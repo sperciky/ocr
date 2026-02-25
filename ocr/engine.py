@@ -68,8 +68,8 @@ def run_ocr(
     confidence_threshold: Drop words with conf < this value (0 = keep all).
     psm:                  Tesseract Page Segmentation Mode.
     """
+    config = f"--psm {psm}"
     try:
-        config = f"--psm {psm}"
         df: pd.DataFrame = pytesseract.image_to_data(
             image,
             lang=lang,
@@ -84,7 +84,32 @@ def run_ocr(
             "  Linux   : sudo apt-get install tesseract-ocr tesseract-ocr-rus"
         ) from None
     except Exception as exc:
-        raise RuntimeError(f"OCR failed: {exc}") from exc
+        # Tesseract raises a generic error when a requested language pack is
+        # missing (e.g. 'rus' not installed).  Detect this and fall back to
+        # 'eng' so the rest of the pipeline can still produce a result.
+        err_str = str(exc).lower()
+        if lang != "eng" and (
+            "failed loading language" in err_str
+            or "could not initialize tesseract" in err_str
+            or "error" in err_str
+        ):
+            logger.warning(
+                "OCR failed with lang=%r (%s). "
+                "Retrying with 'eng' — install the missing tessdata pack "
+                "to enable Russian recognition.",
+                lang, exc,
+            )
+            try:
+                df = pytesseract.image_to_data(
+                    image,
+                    lang="eng",
+                    config=config,
+                    output_type=pytesseract.Output.DATAFRAME,
+                )
+            except Exception as fallback_exc:
+                raise RuntimeError(f"OCR failed: {fallback_exc}") from fallback_exc
+        else:
+            raise RuntimeError(f"OCR failed: {exc}") from exc
 
     # --- Clean up DataFrame ---
     df["text"] = df["text"].fillna("").astype(str).str.strip()
