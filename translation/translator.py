@@ -31,9 +31,37 @@ def check_argos_available() -> bool:
 def check_ru_en_model() -> bool:
     """
     Return True if the Russian → English Argos model is installed.
+
+    Uses two independent strategies so that a freshly installed package
+    is detected even before the translate-layer rebuilds its language graph
+    (which can require a process restart in some Argos versions):
+
+    1. ``argostranslate.package.get_installed_packages()`` — scans the
+       packages directory on disk directly.  This is reliable immediately
+       after ``install_from_path()`` returns.
+    2. ``argostranslate.translate.get_installed_languages()`` — the
+       higher-level API; confirms the model is actually usable.
+
+    Returns True if *either* check passes.
     """
     if not check_argos_available():
         return False
+
+    # ── Strategy 1: package-level disk scan ─────────────────────────────────
+    try:
+        import argostranslate.package
+
+        installed = argostranslate.package.get_installed_packages()
+        if any(
+            getattr(p, "from_code", None) == "ru"
+            and getattr(p, "to_code", None) == "en"
+            for p in installed
+        ):
+            return True
+    except Exception as exc:
+        logger.debug("Package-level check failed: %s", exc)
+
+    # ── Strategy 2: translate-layer language graph ───────────────────────────
     try:
         import argostranslate.translate
 
@@ -43,7 +71,7 @@ def check_ru_en_model() -> bool:
             return False
         return any(t.to_lang.code == "en" for t in ru.translations_to)
     except Exception as exc:
-        logger.warning(f"Could not verify Argos RU→EN model: {exc}")
+        logger.warning("Could not verify Argos RU→EN model: %s", exc)
         return False
 
 
