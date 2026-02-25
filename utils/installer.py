@@ -510,11 +510,21 @@ def install_argos_model(
 # StartupResult + orchestrator
 # ---------------------------------------------------------------------------
 
+def check_tesseract_lang(lang_code: str) -> bool:
+    """Return True if the given Tesseract language pack is installed."""
+    try:
+        import pytesseract
+        return lang_code in pytesseract.get_languages(config="")
+    except Exception:
+        return False
+
+
 class StartupResult:
     def __init__(self) -> None:
         self.python_packages_installed: List[Tuple[str, bool, str]] = []
         self.tesseract_ok: bool = False
         self.tesseract_message: str = ""
+        self.tesseract_rus_ok: bool = False
         self.poppler_ok: bool = False
         self.poppler_path: Optional[str] = None
         self.argos_ok: bool = False
@@ -530,7 +540,7 @@ class StartupResult:
 
     @property
     def all_ok(self) -> bool:
-        return self.tesseract_ok and self.argos_ok
+        return self.tesseract_ok and self.tesseract_rus_ok and self.argos_ok
 
 
 def run_startup_checks(
@@ -545,6 +555,7 @@ def run_startup_checks(
 
     result.python_packages_installed = install_missing_python_packages()
     result.tesseract_ok, result.tesseract_message = configure_tesseract(custom_tesseract_path)
+    result.tesseract_rus_ok = result.tesseract_ok and check_tesseract_lang("rus")
     result.poppler_ok, result.poppler_path = configure_poppler(custom_poppler_path)
 
     try:

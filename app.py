@@ -88,8 +88,8 @@ def _show_startup_banner(result: Any) -> bool:
     """
     from utils.installer import poppler_install_hint
 
-    ok_count = sum([result.tesseract_ok, result.argos_ok, result.poppler_ok])
-    label = f"🔧 Dependency Status  ({ok_count}/3 ready)"
+    ok_count = sum([result.tesseract_ok, result.tesseract_rus_ok, result.argos_ok, result.poppler_ok])
+    label = f"🔧 Dependency Status  ({ok_count}/4 ready)"
 
     with st.expander(label, expanded=not result.all_ok):
 
@@ -131,6 +131,28 @@ def _show_startup_banner(result: Any) -> bool:
                     st.session_state["custom_tesseract"] = manual_tess
                     st.session_state["startup_done"] = False
                     st.rerun()
+
+        # ── Russian language pack ───────────────────────────────────────────
+        if result.tesseract_ok and not result.tesseract_rus_ok:
+            st.warning(
+                "⚠️ **Tesseract Russian language pack (`rus`) not installed.**  \n"
+                "OCR will only recognise Latin characters — Cyrillic text will be "
+                "returned as garbage or empty boxes.  \n"
+                "Install the Russian data file, then click **🔄 Retry Detection**."
+            )
+            st.code(
+                "# Windows (UB-Mannheim installer — re-run, tick 'Russian')\n"
+                "# — or download tessdata manually:\n"
+                "# https://github.com/tesseract-ocr/tessdata/raw/main/rus.traineddata\n"
+                "# Copy rus.traineddata into Tesseract's tessdata\\ folder.\n\n"
+                "# macOS\n"
+                "brew install tesseract-lang\n\n"
+                "# Linux (Debian / Ubuntu)\n"
+                "sudo apt-get install -y tesseract-ocr-rus",
+                language="bash",
+            )
+        elif result.tesseract_ok and result.tesseract_rus_ok:
+            st.success("✅ Tesseract Russian language pack (`rus`) ready.")
 
         st.markdown("---")
 

@@ -34,8 +34,10 @@ from PIL import Image as PILImage
 
 logger = logging.getLogger(__name__)
 
-# Alpha for the white overlay behind translated text (0 = invisible, 1 = solid)
-_TEXT_BOX_ALPHA = 0.88
+# Alpha for the white overlay behind translated text (0 = invisible, 1 = solid).
+# Must be 1.0: any transparency lets the rasterised background text bleed
+# through, creating a ghost / double-text effect on top of the overlay.
+_TEXT_BOX_ALPHA = 1.0
 _PADDING = 3          # px padding inside each text box
 _MIN_FONT  = 6.0
 _MAX_FONT  = 48.0
