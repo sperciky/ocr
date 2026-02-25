@@ -1,20 +1,25 @@
 """
-OCR Recipe Translator — Main Streamlit Application
-===================================================
+OCR Document Translator — Main Streamlit Application
+=====================================================
 Offline OCR (pytesseract) with Russian → English translation (Argos Translate).
 Supports PDF and image inputs; outputs translated PDF, DOCX, or plain text.
+
+Startup behaviour
+-----------------
+1. Missing Python packages are pip-installed automatically on first run.
+2. Tesseract is located at common install paths (no PATH edit required on Windows).
+3. Poppler (pdf2image backend) is located automatically on Windows.
+4. The Argos RU→EN model can be downloaded with one click inside the app.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw
 
@@ -45,131 +50,140 @@ st.markdown(
     <style>
     .block-container { padding-top: 1.5rem; }
     .stAlert { border-radius: 8px; }
-    .metric-label { font-size: 0.85rem !important; }
     div[data-testid="stExpander"] > div { padding: 0.5rem 1rem; }
     .translated-badge {
         background: #d4edda; color: #155724;
         border-radius: 4px; padding: 2px 8px;
         font-size: 0.78rem; font-weight: 600;
     }
+    .ok-badge   { color: #28a745; font-weight: 700; }
+    .warn-badge { color: #ffc107; font-weight: 700; }
+    .err-badge  { color: #dc3545; font-weight: 700; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+
 # ---------------------------------------------------------------------------
-# Dependency checks
+# ① Startup: auto-install Python packages + configure system binaries
+#    Cached so it runs exactly once per Streamlit server session.
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
-def _check_all_dependencies() -> List[Dict[str, str]]:
+def _run_startup() -> "StartupResult":  # noqa: F821  (forward reference resolved below)
+    from utils.installer import run_startup_checks
+    return run_startup_checks()
+
+
+def _show_startup_banner(result: Any) -> None:
     """
-    Run once (cached) to detect missing or misconfigured dependencies.
-    Returns a list of issue dicts: {name, error, fix}.
+    Render a collapsible status panel showing what was auto-fixed and what
+    still needs manual action.  Only shown when something is not perfect.
     """
-    issues: List[Dict[str, str]] = []
+    from utils.installer import poppler_install_hint
 
-    # Tesseract
-    try:
-        from ocr.engine import check_tesseract
-        ok, msg = check_tesseract()
-        if not ok:
-            issues.append({"name": "Tesseract OCR", "error": msg, "fix": msg})
-    except Exception as exc:
-        issues.append({"name": "Tesseract OCR", "error": str(exc), "fix": str(exc)})
+    # Collect lines for the expander title
+    ok_count = sum([result.tesseract_ok, result.argos_ok, result.poppler_ok])
+    total = 3
+    title = f"🔧 Dependency Status  ({ok_count}/{total} ready)"
 
-    # pdf2image / Poppler
-    try:
-        from pdf2image import convert_from_bytes  # noqa: F401
-    except ImportError:
-        issues.append(
-            {
-                "name": "pdf2image / Poppler",
-                "error": "pdf2image is not installed.",
-                "fix": (
-                    "pip install pdf2image\n"
-                    "Then install Poppler:\n"
-                    "  macOS  : brew install poppler\n"
-                    "  Linux  : sudo apt-get install poppler-utils\n"
-                    "  Windows: https://github.com/oschwartz10612/poppler-windows"
-                ),
-            }
-        )
+    with st.expander(title, expanded=not result.all_ok):
 
-    # Argos Translate package
-    try:
-        import argostranslate.translate  # noqa: F401
-    except ImportError:
-        issues.append(
-            {
-                "name": "argostranslate",
-                "error": "argostranslate package is not installed.",
-                "fix": "pip install argostranslate",
-            }
-        )
-        return issues  # model check would fail anyway
+        # ── Python packages ────────────────────────────────────────────────
+        if result.python_packages_installed:
+            installed_ok   = [p for p, ok, _ in result.python_packages_installed if ok]
+            installed_fail = [(p, m) for p, ok, m in result.python_packages_installed if not ok]
+            if installed_ok:
+                st.success(f"✅ Auto-installed Python packages: {', '.join(installed_ok)}")
+            for pkg, msg in installed_fail:
+                st.error(f"❌ Could not install `{pkg}`: {msg}")
+        else:
+            st.success("✅ All Python packages already installed.")
 
-    # Argos RU→EN model
-    try:
-        from translation.translator import check_ru_en_model, get_install_instructions
-        if not check_ru_en_model():
-            issues.append(
-                {
-                    "name": "Argos RU→EN Model",
-                    "error": "The Russian → English translation model is not installed.",
-                    "fix": get_install_instructions(),
-                }
+        st.markdown("---")
+
+        # ── Tesseract ──────────────────────────────────────────────────────
+        if result.tesseract_ok:
+            st.success(f"✅ Tesseract — {result.tesseract_message}")
+        else:
+            st.error("❌ **Tesseract OCR** — not found. The app cannot run without it.")
+            st.code(result.tesseract_message, language="bash")
+
+        st.markdown("---")
+
+        # ── Poppler ────────────────────────────────────────────────────────
+        if result.poppler_ok:
+            loc = f" at `{result.poppler_path}`" if result.poppler_path else " (in PATH)"
+            st.success(f"✅ Poppler{loc}")
+        else:
+            st.warning("⚠️ Poppler not found — PDF rendering may fail.")
+            st.code(poppler_install_hint(), language="bash")
+
+        st.markdown("---")
+
+        # ── Argos model ────────────────────────────────────────────────────
+        if result.argos_ok:
+            st.success("✅ Argos RU→EN model installed.")
+        else:
+            st.warning(
+                "⚠️ Argos RU→EN translation model is not installed.  "
+                "OCR will still work but Russian text **won't be translated** "
+                "until you click the button below."
             )
-    except Exception as exc:
-        issues.append({"name": "Argos RU→EN Model", "error": str(exc), "fix": str(exc)})
-
-    return issues
+            _render_argos_install_button()
 
 
-def render_dependency_warnings(issues: List[Dict[str, str]]) -> bool:
-    """
-    Render dependency issues in the UI.
-    Returns True if Tesseract is missing (critical — app cannot proceed).
-    """
-    if not issues:
-        return False
+def _render_argos_install_button() -> None:
+    """Render a button that downloads and installs the Argos RU→EN model."""
+    st.markdown(
+        "The model is ~100 MB and requires an internet connection **once**.  "
+        "After installation the app is fully offline."
+    )
+    if st.button("⬇️ Download & Install RU→EN Model Now", type="primary"):
+        status_box = st.empty()
+        progress = st.progress(0)
+        messages: List[str] = []
 
-    tesseract_missing = any(i["name"] == "Tesseract OCR" for i in issues)
-    translation_missing = any("RU→EN" in i["name"] for i in issues)
+        def _cb(msg: str) -> None:
+            messages.append(msg)
+            status_box.info(f"⏳ {msg}")
+            # crude progress: bump by 33 % each callback
+            progress.progress(min(1.0, len(messages) * 0.33))
 
-    if tesseract_missing:
-        st.error("❌ **Tesseract OCR** is not installed. The application cannot run without it.")
+        from utils.installer import install_argos_model
+        ok, msg = install_argos_model(progress_callback=_cb)
 
-    for issue in issues:
-        severity = "error" if issue["name"] == "Tesseract OCR" else "warning"
-        with st.expander(
-            f"{'❌' if severity == 'error' else '⚠️'} {issue['name']}: {issue['error']}",
-            expanded=tesseract_missing,
-        ):
-            st.code(issue["fix"], language="bash")
-
-    if translation_missing and not tesseract_missing:
-        st.warning(
-            "⚠️ Translation model not found — OCR will still run but Russian text "
-            "will **not** be translated. See the expander above for install steps."
-        )
-
-    return tesseract_missing
+        progress.progress(1.0)
+        if ok:
+            status_box.success(f"✅ {msg}")
+            # Invalidate cached startup so status updates
+            _run_startup.clear()
+            st.rerun()
+        else:
+            status_box.error(f"❌ {msg}")
+            st.code(
+                "# Manual install (run once from any terminal):\n"
+                "python -c \"\n"
+                "import argostranslate.package\n"
+                "argostranslate.package.update_package_index()\n"
+                "pkgs = argostranslate.package.get_available_packages()\n"
+                "pkg  = next(p for p in pkgs if p.from_code=='ru' and p.to_code=='en')\n"
+                "argostranslate.package.install_from_path(pkg.download())\n"
+                "\"",
+                language="bash",
+            )
 
 
 # ---------------------------------------------------------------------------
-# Processing helpers
+# ② Processing pipeline
 # ---------------------------------------------------------------------------
 
 def _draw_bounding_boxes(
     image: Image.Image,
     blocks: List[Dict[str, Any]],
-    show_confidence: bool = False,
 ) -> Image.Image:
-    """
-    Return a copy of *image* with coloured bounding boxes overlaid.
-    Green = original text kept; Red = translated from Russian.
-    """
+    """Overlay coloured bounding boxes. Green = kept, Red = translated."""
     img_copy = image.copy().convert("RGBA")
     overlay = Image.new("RGBA", img_copy.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
@@ -177,15 +191,9 @@ def _draw_bounding_boxes(
     for block in blocks:
         x, y, w, h = block["bbox"]
         was_translated = block.get("was_translated", False)
-        conf = block.get("confidence", 100)
-
-        colour = (220, 53, 69, 120) if was_translated else (40, 167, 69, 100)
+        fill    = (220, 53, 69, 110) if was_translated else (40, 167, 69,  90)
         outline = (220, 53, 69, 255) if was_translated else (40, 167, 69, 255)
-
-        draw.rectangle([x, y, x + w, y + h], fill=colour, outline=outline, width=2)
-
-        if show_confidence:
-            draw.text((x + 2, y + 2), f"{conf:.0f}%", fill=(0, 0, 0, 200))
+        draw.rectangle([x, y, x + w, y + h], fill=fill, outline=outline, width=2)
 
     return Image.alpha_composite(img_copy, overlay).convert("RGB")
 
@@ -199,19 +207,16 @@ def process_single_page(
     preprocess_opts: Dict[str, bool],
     translate_enabled: bool,
 ) -> Dict[str, Any]:
-    """
-    Full processing pipeline for a single page:
-    preprocess → OCR → layout → translate.
-    """
-    from ocr.engine import run_ocr, ocr_to_blocks
+    """Full pipeline: preprocess → OCR → layout analysis → translate."""
+    from ocr.engine import ocr_to_blocks, run_ocr
     from ocr.layout import detect_columns, sort_blocks_reading_order
-    from ocr.preprocessing import preprocess_image, pil_to_cv2, cv2_to_pil
+    from ocr.preprocessing import cv2_to_pil, pil_to_cv2, preprocess_image
     from translation.translator import translate_blocks
     from utils.file_handler import get_page_dimensions
 
-    t_start = time.perf_counter()
+    t0 = time.perf_counter()
 
-    # ── Preprocessing ──────────────────────────────────────────────────────
+    # Preprocessing
     cv2_img = pil_to_cv2(page_img)
     processed_cv2 = preprocess_image(
         cv2_img,
@@ -222,35 +227,28 @@ def process_single_page(
     )
     processed_pil = cv2_to_pil(processed_cv2)
 
-    # ── OCR ────────────────────────────────────────────────────────────────
-    ocr_df = run_ocr(
-        processed_pil,
-        lang=lang,
-        confidence_threshold=confidence_threshold,
-    )
+    # OCR
+    ocr_df = run_ocr(processed_pil, lang=lang, confidence_threshold=confidence_threshold)
     blocks = ocr_to_blocks(ocr_df)
 
-    # ── Layout ─────────────────────────────────────────────────────────────
+    # Layout
     page_w, page_h = get_page_dimensions(page_img)
     num_cols = detect_columns(blocks, page_w)
     blocks = sort_blocks_reading_order(blocks, num_cols, page_w)
 
-    # ── Translation ────────────────────────────────────────────────────────
+    # Translation
     blocks = translate_blocks(blocks, enabled=translate_enabled)
 
-    # Filter embedded images for this page
-    page_embedded = [img for img in embedded_images if img.get("page") == page_num]
-
-    elapsed = time.perf_counter() - t_start
+    page_images_embedded = [img for img in embedded_images if img.get("page") == page_num]
 
     return {
         "page_number": page_num + 1,
         "width": page_w,
         "height": page_h,
         "blocks": blocks,
-        "images": page_embedded,
+        "images": page_images_embedded,
         "num_columns": num_cols,
-        "processing_time": elapsed,
+        "processing_time": time.perf_counter() - t0,
         "word_count": sum(len(b["text"].split()) for b in blocks),
         "translation_word_count": sum(
             len(b.get("translated_text", "").split())
@@ -260,11 +258,11 @@ def process_single_page(
     }
 
 
-def build_json_export(
-    filename: str,
-    pages_data: List[Dict[str, Any]],
-) -> bytes:
-    """Serialise OCR results to the canonical JSON format."""
+# ---------------------------------------------------------------------------
+# ③ Export helpers
+# ---------------------------------------------------------------------------
+
+def _build_json_export(filename: str, pages_data: List[Dict[str, Any]]) -> bytes:
     payload = {
         "filename": filename,
         "pages": [
@@ -286,39 +284,27 @@ def build_json_export(
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def build_plain_text_export(pages_data: List[Dict[str, Any]]) -> bytes:
-    """Produce a plain-text document with translated content."""
+def _build_plain_text_export(pages_data: List[Dict[str, Any]]) -> bytes:
     lines: List[str] = []
     for page in pages_data:
-        lines.append(f"{'=' * 60}")
-        lines.append(f"  Page {page['page_number']}")
-        lines.append(f"{'=' * 60}")
+        lines += [f"{'=' * 60}", f"  Page {page['page_number']}", f"{'=' * 60}"]
         for block in page["blocks"]:
             text = block.get("translated_text", block.get("text", ""))
             if text.strip():
-                lines.append(text)
-                lines.append("")
+                lines += [text, ""]
     return "\n".join(lines).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# ④ Sidebar
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> Dict[str, Any]:
-    """Render sidebar controls and return current settings."""
+def _render_sidebar() -> Dict[str, Any]:
     with st.sidebar:
-        st.image(
-            "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/"
-            "Single_line_diagram_of_Tesseract_OCR_engine.svg/320px-"
-            "Single_line_diagram_of_Tesseract_OCR_engine.svg.png",
-            use_column_width=True,
-        ) if False else None  # placeholder — no external URLs used
-
         st.title("⚙️ Settings")
         st.markdown("---")
 
-        # ── OCR ───────────────────────────────────────────────────────────
+        # OCR
         st.subheader("🔍 OCR")
         lang_map = {
             "English + Russian (default)": "eng+rus",
@@ -330,73 +316,46 @@ def render_sidebar() -> Dict[str, Any]:
             "English + Czech": "eng+ces",
             "All supported": "eng+rus+deu+fra+ita+ces",
         }
-        selected_lang = st.selectbox(
-            "OCR Language Pack",
-            list(lang_map.keys()),
-            index=0,
-            help="Language(s) passed to Tesseract. Use '+' combinations for multi-language docs.",
+        ocr_lang = lang_map[
+            st.selectbox("OCR Language Pack", list(lang_map.keys()), index=0)
+        ]
+        confidence_threshold = float(
+            st.slider("Confidence Threshold (%)", 0, 100, 30, 5,
+                      help="Discard OCR words below this score.")
         )
-        ocr_lang = lang_map[selected_lang]
-
-        confidence_threshold = st.slider(
-            "Confidence Threshold (%)",
-            min_value=0,
-            max_value=100,
-            value=30,
-            step=5,
-            help="Discard OCR words below this confidence. Lower = more text, possibly noisy.",
-        )
-
-        dpi = st.select_slider(
-            "Rendering DPI (PDF only)",
-            options=[100, 150, 200, 250, 300],
-            value=200,
-            help="Higher DPI → better OCR accuracy but slower processing and more memory.",
+        dpi = int(
+            st.select_slider("Rendering DPI (PDF only)", [100, 150, 200, 250, 300], value=200,
+                             help="Higher = better quality, more RAM.")
         )
 
         st.markdown("---")
 
-        # ── Preprocessing ─────────────────────────────────────────────────
+        # Preprocessing
         st.subheader("🖼️ Preprocessing")
         preprocess_opts = {
-            "grayscale": st.checkbox("Grayscale", value=False, help="Convert to greyscale before OCR."),
-            "threshold": st.checkbox(
-                "Binarize (Otsu)",
-                value=False,
-                help="Apply Otsu thresholding. Disables grayscale option when enabled.",
-            ),
-            "denoise": st.checkbox("Denoise", value=False, help="Non-Local Means denoising."),
-            "deskew": st.checkbox("Deskew", value=False, help="Auto-correct document skew angle."),
+            "grayscale": st.checkbox("Grayscale"),
+            "threshold": st.checkbox("Binarize (Otsu)", help="Best for scanned black/white docs."),
+            "denoise":   st.checkbox("Denoise"),
+            "deskew":    st.checkbox("Deskew",   help="Auto-correct skewed pages."),
         }
 
         st.markdown("---")
 
-        # ── Translation ───────────────────────────────────────────────────
+        # Translation
         st.subheader("🌐 Translation")
-        translate_enabled = st.checkbox(
-            "Enable RU → EN Translation",
-            value=True,
-            help="Translate detected Russian text to English using Argos Translate (offline).",
-        )
+        translate_enabled = st.checkbox("Enable RU → EN Translation", value=True)
 
         st.markdown("---")
 
-        # ── Display ───────────────────────────────────────────────────────
+        # Display
         st.subheader("🖥️ Display")
-        show_bbox = st.checkbox(
-            "Show Bounding Boxes",
-            value=False,
-            help="Overlay OCR bounding boxes on the page preview.\nGreen = original, Red = translated.",
-        )
-        show_confidence = st.checkbox(
-            "Show Confidence Scores",
-            value=True,
-            help="Display per-block OCR confidence in the text panel.",
-        )
+        show_bbox       = st.checkbox("Show Bounding Boxes",
+                                      help="Green = kept  |  Red = translated")
+        show_confidence = st.checkbox("Show Confidence Scores", value=True)
 
         st.markdown("---")
 
-        # ── Output ────────────────────────────────────────────────────────
+        # Output
         st.subheader("📤 Output Format")
         output_format = st.radio(
             "Generate",
@@ -404,95 +363,84 @@ def render_sidebar() -> Dict[str, Any]:
             index=0,
         )
 
-    return {
-        "ocr_lang": ocr_lang,
-        "confidence_threshold": float(confidence_threshold),
-        "dpi": int(dpi),
-        "preprocess_opts": preprocess_opts,
-        "translate_enabled": translate_enabled,
-        "show_bbox": show_bbox,
-        "show_confidence": show_confidence,
-        "output_format": output_format,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Results display
-# ---------------------------------------------------------------------------
-
-def render_summary_metrics(pages_data: List[Dict[str, Any]]) -> None:
-    total_pages = len(pages_data)
-    total_words = sum(p["word_count"] for p in pages_data)
-    total_translated = sum(p["translation_word_count"] for p in pages_data)
-    total_time = sum(p["processing_time"] for p in pages_data)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Pages", total_pages)
-    c2.metric("Words Detected", f"{total_words:,}")
-    c3.metric("Words Translated", f"{total_translated:,}")
-    c4.metric("Total Time", f"{total_time:.1f} s")
-    c5.metric(
-        "Translation %",
-        f"{(total_translated / total_words * 100):.0f}%" if total_words else "—",
+    return dict(
+        ocr_lang=ocr_lang,
+        confidence_threshold=confidence_threshold,
+        dpi=dpi,
+        preprocess_opts=preprocess_opts,
+        translate_enabled=translate_enabled,
+        show_bbox=show_bbox,
+        show_confidence=show_confidence,
+        output_format=output_format,
     )
 
 
-def render_page_results(
+# ---------------------------------------------------------------------------
+# ⑤ Results display
+# ---------------------------------------------------------------------------
+
+def _render_metrics(pages_data: List[Dict[str, Any]]) -> None:
+    total_words      = sum(p["word_count"] for p in pages_data)
+    total_translated = sum(p["translation_word_count"] for p in pages_data)
+    total_time       = sum(p["processing_time"] for p in pages_data)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Pages",            len(pages_data))
+    c2.metric("Words Detected",   f"{total_words:,}")
+    c3.metric("Words Translated",  f"{total_translated:,}")
+    c4.metric("Processing Time",  f"{total_time:.1f} s")
+    c5.metric(
+        "Translation %",
+        f"{total_translated / total_words * 100:.0f}%" if total_words else "—",
+    )
+
+
+def _render_page(
     page_data: Dict[str, Any],
     page_img: Image.Image,
     settings: Dict[str, Any],
 ) -> None:
-    """Render a single page's results inside an expander."""
+    blocks   = page_data["blocks"]
     page_num = page_data["page_number"]
-    blocks = page_data["blocks"]
 
     with st.expander(
         f"📄 Page {page_num}  —  "
         f"{page_data['word_count']} words  |  "
         f"{page_data['num_columns']} col(s)  |  "
-        f"{page_data['processing_time']:.2f}s",
+        f"{page_data['processing_time']:.2f} s",
         expanded=(page_num == 1),
     ):
-        col_preview, col_text = st.columns([1, 1], gap="medium")
+        col_img, col_txt = st.columns([1, 1], gap="medium")
 
-        # ── Left: page preview ─────────────────────────────────────────────
-        with col_preview:
+        with col_img:
             st.markdown("**Original Page**")
+            display = (
+                _draw_bounding_boxes(page_img, blocks)
+                if settings["show_bbox"] and blocks
+                else page_img
+            )
+            st.image(display, use_column_width=True)
             if settings["show_bbox"] and blocks:
-                preview = _draw_bounding_boxes(
-                    page_img,
-                    blocks,
-                    show_confidence=False,
-                )
-                st.image(preview, use_column_width=True)
                 st.caption("🟢 Kept original  🔴 Translated from Russian")
-            else:
-                st.image(page_img, use_column_width=True)
-
             if page_data["num_columns"] > 1:
-                st.info(f"📊 Multi-column layout detected ({page_data['num_columns']} columns)")
-
+                st.info(f"📊 Multi-column layout ({page_data['num_columns']} columns)")
             st.caption(
-                f"Page size: {page_data['width']} × {page_data['height']} px  |  "
-                f"Embedded images: {len(page_data.get('images', []))}"
+                f"{page_data['width']} × {page_data['height']} px  |  "
+                f"{len(page_data.get('images', []))} embedded image(s)"
             )
 
-        # ── Right: text blocks ─────────────────────────────────────────────
-        with col_text:
+        with col_txt:
             st.markdown("**Extracted & Translated Text**")
-
             if not blocks:
                 st.info("No text detected on this page.")
             else:
                 for block in blocks:
-                    original = block.get("text", "")
-                    translated = block.get("translated_text", original)
+                    original       = block.get("text", "")
+                    translated     = block.get("translated_text", original)
                     was_translated = block.get("was_translated", False)
-                    conf = block.get("confidence", 0.0)
-
+                    conf           = block.get("confidence", 0.0)
                     if not original.strip():
                         continue
-
                     with st.container():
                         if was_translated:
                             st.markdown(
@@ -506,13 +454,12 @@ def render_page_results(
                             st.markdown(f"**EN:** {translated}")
                         else:
                             st.write(translated)
-
                         if settings["show_confidence"]:
                             st.caption(f"Confidence: {conf:.1f}%")
                         st.divider()
 
 
-def render_download_section(
+def _render_downloads(
     filename: str,
     pages_data: List[Dict[str, Any]],
     page_images: List[Image.Image],
@@ -520,58 +467,47 @@ def render_download_section(
 ) -> None:
     st.markdown("---")
     st.subheader("⬇️ Download Results")
-
     stem = Path(filename).stem
-    col1, col2, col3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
 
-    # ── JSON export ────────────────────────────────────────────────────────
-    with col1:
-        json_bytes = build_json_export(filename, pages_data)
+    with c1:
         st.download_button(
-            label="📊 JSON (OCR data)",
-            data=json_bytes,
+            "📊 JSON (OCR data)",
+            data=_build_json_export(filename, pages_data),
             file_name=f"{stem}_ocr.json",
             mime="application/json",
             use_container_width=True,
         )
-
-    # ── Plain text ─────────────────────────────────────────────────────────
-    with col2:
-        text_bytes = build_plain_text_export(pages_data)
+    with c2:
         st.download_button(
-            label="📝 Plain Text",
-            data=text_bytes,
+            "📝 Plain Text",
+            data=_build_plain_text_export(pages_data),
             file_name=f"{stem}_translated.txt",
             mime="text/plain",
             use_container_width=True,
         )
-
-    # ── Primary format (PDF / DOCX / extra text) ───────────────────────────
-    with col3:
+    with c3:
         if output_format == "Translated PDF":
-            with st.spinner("Building translated PDF …"):
+            with st.spinner("Building PDF …"):
                 try:
                     from reconstruction.pdf_builder import build_pdf
-                    pdf_bytes = build_pdf(pages_data, page_images)
                     st.download_button(
-                        label="📄 Translated PDF",
-                        data=pdf_bytes,
+                        "📄 Translated PDF",
+                        data=build_pdf(pages_data, page_images),
                         file_name=f"{stem}_translated.pdf",
                         mime="application/pdf",
                         use_container_width=True,
                     )
                 except Exception as exc:
                     st.error(f"PDF generation failed: {exc}")
-                    logger.exception(exc)
 
         elif output_format == "Translated DOCX":
             with st.spinner("Building DOCX …"):
                 try:
                     from reconstruction.docx_builder import build_docx
-                    docx_bytes = build_docx(pages_data, page_images)
                     st.download_button(
-                        label="📝 Translated DOCX",
-                        data=docx_bytes,
+                        "📝 Translated DOCX",
+                        data=build_docx(pages_data, page_images),
                         file_name=f"{stem}_translated.docx",
                         mime=(
                             "application/vnd.openxmlformats-officedocument"
@@ -581,13 +517,10 @@ def render_download_section(
                     )
                 except Exception as exc:
                     st.error(f"DOCX generation failed: {exc}")
-                    logger.exception(exc)
-
         else:
-            # Raw text — already available above; show a second button here too
             st.download_button(
-                label="📝 Raw Text (copy)",
-                data=build_plain_text_export(pages_data),
+                "📝 Raw Text",
+                data=_build_plain_text_export(pages_data),
                 file_name=f"{stem}_raw.txt",
                 mime="text/plain",
                 use_container_width=True,
@@ -595,94 +528,94 @@ def render_download_section(
 
 
 # ---------------------------------------------------------------------------
-# Welcome / help panel
+# ⑥ Welcome panel
 # ---------------------------------------------------------------------------
 
-def render_welcome() -> None:
+def _render_welcome() -> None:
     st.markdown(
         """
         ## Welcome to the OCR Document Translator
 
-        Upload a **PDF** or **image** (JPG/PNG) to extract text with Tesseract OCR,
-        optionally translate Russian content to English offline, and download the result.
+        Upload a **PDF** or **image** (JPG / PNG) to:
+
+        - Extract text using **Tesseract OCR** (word-level bounding boxes)
+        - Automatically detect and translate **Russian → English** (offline)
+        - Preserve the original document layout and embedded images
+        - Download the result as a translated **PDF**, **DOCX**, or plain text
 
         ---
-        ### Quick-start checklist
 
-        | Step | What to do |
-        |------|-----------|
-        | 1 | Install **Tesseract** and the Russian language pack |
-        | 2 | Install **Poppler** (required by pdf2image for PDF support) |
-        | 3 | Install **Argos RU→EN model** (see sidebar warning if missing) |
-        | 4 | Upload your document using the widget above |
-        | 5 | Adjust settings in the sidebar |
-        | 6 | Click **Run OCR & Translate** |
+        ### Supported inputs
+        | Format | Notes |
+        |--------|-------|
+        | PDF    | Scanned or native; multi-page; may contain embedded images |
+        | JPG / JPEG / PNG | Single-page image |
 
-        ---
-        ### Supported file types
-        - **PDF** — multi-page, scanned, or native (with embedded images)
-        - **JPG / JPEG / PNG** — single-page image documents
-
-        ### Supported OCR languages
+        ### OCR Languages
         English · Russian · German · French · Italian · Czech
 
-        ### Translation
-        Russian text is detected automatically and translated **completely offline**
-        using [Argos Translate](https://github.com/argosopentech/argos-translate).
-        No internet connection is required once the model is installed.
+        ### How translation works
+        Russian text is detected by Cyrillic character ratio (≥ 35 %).
+        Translation uses **Argos Translate** — completely offline once the
+        model is installed (see the status panel above if the model is missing).
         """
     )
 
 
 # ---------------------------------------------------------------------------
-# Main application
+# ⑦ Main entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     st.title("📄 OCR Document Translator")
     st.markdown(
-        "Offline OCR · Russian → English translation · "
+        "Offline OCR · Russian → English · "
         "PDF / DOCX output with layout preservation"
     )
 
-    # Dependency check (cached)
-    with st.spinner("Checking dependencies …"):
-        issues = _check_all_dependencies()
+    # ── Startup: auto-install packages + configure binaries ─────────────────
+    with st.spinner("Checking and configuring dependencies …"):
+        startup = _run_startup()
 
-    critical = render_dependency_warnings(issues)
-    if critical:
+    # Always show the status banner so users can see what was auto-fixed
+    _show_startup_banner(startup)
+
+    # Hard stop: Tesseract is required for any OCR
+    if startup.tesseract_missing:
+        st.error(
+            "❌ Tesseract OCR must be installed before you can use this app.  "
+            "See the **Dependency Status** panel above for platform-specific instructions."
+        )
         st.stop()
 
     # Sidebar
-    settings = render_sidebar()
+    settings = _render_sidebar()
 
     # File upload
     uploaded = st.file_uploader(
         "Upload a PDF or image file",
         type=["pdf", "jpg", "jpeg", "png"],
-        help="Maximum recommended size: ~50 MB. Larger files may be slow.",
-        label_visibility="visible",
+        help="Recommended max size: ~50 MB",
     )
 
     if uploaded is None:
-        render_welcome()
+        _render_welcome()
         return
 
     file_bytes = uploaded.read()
-    filename = uploaded.name
-    file_ext = Path(filename).suffix.lower()
+    filename   = uploaded.name
+    file_ext   = Path(filename).suffix.lower()
 
     st.markdown(
-        f"**File:** `{filename}` &nbsp;|&nbsp; "
-        f"**Size:** {len(file_bytes) / 1024:.1f} KB"
+        f"**File:** `{filename}`  |  **Size:** {len(file_bytes) / 1024:.1f} KB"
     )
 
     # Load document
     with st.spinner("Loading document …"):
         try:
             if file_ext == ".pdf":
-                from utils.file_handler import pdf_to_images, extract_embedded_images
-                page_images = pdf_to_images(file_bytes, dpi=settings["dpi"])
+                from utils.file_handler import extract_embedded_images, pdf_to_images
+                page_images     = pdf_to_images(file_bytes, dpi=settings["dpi"])
                 embedded_images = extract_embedded_images(file_bytes)
                 st.success(
                     f"✅ PDF loaded — {len(page_images)} page(s), "
@@ -690,7 +623,7 @@ def main() -> None:
                 )
             else:
                 from utils.file_handler import load_image
-                page_images = [load_image(file_bytes, filename)]
+                page_images     = [load_image(file_bytes, filename)]
                 embedded_images = []
                 w, h = page_images[0].width, page_images[0].height
                 st.success(f"✅ Image loaded — {w} × {h} px")
@@ -700,65 +633,55 @@ def main() -> None:
             return
 
     # Run button
-    run_clicked = st.button("🔍 Run OCR & Translate", type="primary", use_container_width=True)
-
-    if run_clicked:
-        all_pages_data: List[Dict[str, Any]] = []
-        progress_bar = st.progress(0.0)
+    if st.button("🔍 Run OCR & Translate", type="primary", use_container_width=True):
+        all_pages: List[Dict[str, Any]] = []
+        bar    = st.progress(0.0)
         status = st.empty()
+        total  = len(page_images)
 
-        for page_idx, page_img in enumerate(page_images):
-            status.text(
-                f"Processing page {page_idx + 1} / {len(page_images)} …"
-            )
+        for idx, page_img in enumerate(page_images):
+            status.text(f"Processing page {idx + 1} / {total} …")
             try:
                 page_data = process_single_page(
                     page_img=page_img,
                     embedded_images=embedded_images,
-                    page_num=page_idx,
+                    page_num=idx,
                     lang=settings["ocr_lang"],
                     confidence_threshold=settings["confidence_threshold"],
                     preprocess_opts=settings["preprocess_opts"],
                     translate_enabled=settings["translate_enabled"],
                 )
-                all_pages_data.append(page_data)
+                all_pages.append(page_data)
             except Exception as exc:
-                st.error(f"Error on page {page_idx + 1}: {exc}")
+                st.error(f"Error on page {idx + 1}: {exc}")
                 logger.exception(exc)
-            finally:
-                progress_bar.progress((page_idx + 1) / len(page_images))
+            bar.progress((idx + 1) / total)
 
-        status.text("✅ All pages processed.")
-        progress_bar.empty()
+        bar.empty()
+        status.success(f"✅ Processed {len(all_pages)} / {total} page(s).")
 
-        # Cache results in session state
-        st.session_state["pages_data"] = all_pages_data
-        st.session_state["page_images"] = page_images
-        st.session_state["filename"] = filename
-        st.session_state["settings"] = settings
+        st.session_state["pages_data"]   = all_pages
+        st.session_state["page_images"]  = page_images
+        st.session_state["filename"]     = filename
+        st.session_state["settings"]     = settings
 
-    # Render results (from session state so they persist across re-renders)
+    # Render results (persists between sidebar changes without re-running OCR)
     if st.session_state.get("pages_data"):
-        pages_data: List[Dict[str, Any]] = st.session_state["pages_data"]
-        page_images_cached: List[Image.Image] = st.session_state["page_images"]
-        cached_filename: str = st.session_state["filename"]
-        cached_settings: Dict[str, Any] = st.session_state.get("settings", settings)
+        pages_data:  List[Dict[str, Any]] = st.session_state["pages_data"]
+        imgs_cached: List[Image.Image]    = st.session_state["page_images"]
+        fn_cached:   str                  = st.session_state["filename"]
+        cfg:         Dict[str, Any]       = st.session_state.get("settings", settings)
 
         st.markdown("---")
-        st.subheader("📊 Results Summary")
-        render_summary_metrics(pages_data)
+        st.subheader("📊 Summary")
+        _render_metrics(pages_data)
 
         st.markdown("---")
-        st.subheader("📄 Page-by-Page Results")
-        for page_data, page_img in zip(pages_data, page_images_cached):
-            render_page_results(page_data, page_img, cached_settings)
+        st.subheader("📄 Pages")
+        for pd_, pi_ in zip(pages_data, imgs_cached):
+            _render_page(pd_, pi_, cfg)
 
-        render_download_section(
-            filename=cached_filename,
-            pages_data=pages_data,
-            page_images=page_images_cached,
-            output_format=settings["output_format"],
-        )
+        _render_downloads(fn_cached, pages_data, imgs_cached, settings["output_format"])
 
 
 if __name__ == "__main__":
