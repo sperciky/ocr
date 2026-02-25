@@ -159,14 +159,32 @@ def _show_startup_banner(result: Any) -> bool:
         st.markdown("---")
 
         # ── Argos model ────────────────────────────────────────────────────
+        # Show a persistent install-result message that survives st.rerun()
+        if st.session_state.get("argos_install_msg"):
+            msg_type, msg_text = st.session_state.pop("argos_install_msg")
+            if msg_type == "ok":
+                st.success(f"✅ {msg_text}")
+            else:
+                st.warning(f"⚠️ {msg_text}")
+
         if result.argos_ok:
             st.success("✅ Argos RU→EN model ready.")
         else:
-            st.warning(
-                "⚠️ **RU→EN translation model not installed.**  "
-                "OCR still works — Russian text just won't be translated."
-            )
-            _render_argos_install_button()
+            # Check whether a successful install was just done but the
+            # language graph hasn't refreshed — guide the user to restart.
+            if st.session_state.get("argos_install_attempted"):
+                st.session_state.pop("argos_install_attempted")
+                st.warning(
+                    "⚠️ **Model was installed but the app needs one restart to pick it up.**  \n"
+                    "Please stop the Streamlit server (`Ctrl+C`) and run `streamlit run app.py` again.  \n"
+                    "Translation will work normally after that."
+                )
+            else:
+                st.warning(
+                    "⚠️ **RU→EN translation model not installed.**  "
+                    "OCR still works — Russian text just won't be translated."
+                )
+                _render_argos_install_button()
 
         st.markdown("---")
 
@@ -188,17 +206,21 @@ def _render_argos_install_button() -> None:
         status_box = st.empty()
         bar = st.progress(0)
         calls: List[str] = []
+        # 4 stages: fetch-index, download, install, verify
+        _TOTAL_STAGES = 4
 
         def _cb(msg: str) -> None:
             calls.append(msg)
             status_box.info(f"⏳ {msg}")
-            bar.progress(min(1.0, len(calls) / 3))
+            bar.progress(min(1.0, len(calls) / _TOTAL_STAGES))
 
         from utils.installer import install_argos_model
         ok, msg = install_argos_model(progress_callback=_cb)
         bar.progress(1.0)
+
         if ok:
-            status_box.success(f"✅ {msg}")
+            # Store the success message so it survives the rerun
+            st.session_state["argos_install_msg"] = ("ok", msg)
             st.session_state["startup_done"] = False
             st.rerun()
         else:
@@ -213,6 +235,7 @@ def _render_argos_install_button() -> None:
                 'argostranslate.package.install_from_path(pkg.download())\n"',
                 language="bash",
             )
+            st.session_state["argos_install_attempted"] = True
 
 
 # ---------------------------------------------------------------------------

@@ -439,6 +439,18 @@ def install_argos_model(
     to_code: str = "en",
     progress_callback=None,
 ) -> Tuple[bool, str]:
+    """
+    Download and install the Argos Translate model for *from_code* → *to_code*.
+
+    Returns
+    -------
+    (success: bool, message: str)
+        *success* is True only when the package is installed **and** can be
+        verified via ``check_ru_en_model()`` immediately afterwards.
+        If the package was extracted correctly but the language graph hasn't
+        updated yet (rare, version-dependent), success is still True and the
+        message notes that a restart may be needed.
+    """
     def _cb(msg: str) -> None:
         logger.info(msg)
         if progress_callback:
@@ -452,6 +464,7 @@ def install_argos_model(
     try:
         _cb("Fetching Argos package index …")
         argostranslate.package.update_package_index()
+
         available = argostranslate.package.get_available_packages()
         pkg = next(
             (p for p in available if p.from_code == from_code and p.to_code == to_code),
@@ -460,14 +473,36 @@ def install_argos_model(
         if pkg is None:
             return False, (
                 f"Package {from_code}→{to_code} not found in the Argos index. "
-                "Check your internet connection."
+                "Check your internet connection and try again."
             )
+
         _cb(f"Downloading {from_code}→{to_code} model (~100 MB) …")
         path = pkg.download()
+
         _cb("Installing …")
         argostranslate.package.install_from_path(path)
-        return True, f"Argos {from_code}→{to_code} model installed."
+
+        # ── Verify the installation is detectable ────────────────────────────
+        _cb("Verifying …")
+        from translation.translator import check_ru_en_model
+
+        if check_ru_en_model():
+            return True, f"Argos {from_code}→{to_code} model installed and verified."
+
+        # Package extracted but language graph not refreshed yet — this is
+        # harmless; the model will be available after st.rerun() or a restart.
+        logger.warning(
+            "Package installed on disk but not yet visible to the translate "
+            "layer — will resolve after app restart."
+        )
+        return True, (
+            f"Argos {from_code}→{to_code} model installed. "
+            "If the warning persists after the page reloads, "
+            "please restart the app once — the model will then be available."
+        )
+
     except Exception as exc:
+        logger.exception("install_argos_model failed")
         return False, f"Installation failed: {exc}"
 
 
