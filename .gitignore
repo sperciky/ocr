@@ -1,2 +1,8 @@
 merge_claude.py
 config_git_claude_repo.json
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.env
